@@ -1,0 +1,563 @@
+#!/usr/bin/python3
+"""
+BusKill Light - control window and command line client.
+
+The actual detection and shutdown is done by the system service
+(buskill-light.service). Closing this window does NOT disarm BusKill.
+
+Usage:
+  buskill-light            open the window
+  buskill-light status     show state and the last self-test
+  buskill-light start      arm (pulling the cable = power off)
+  buskill-light stop       disarm
+  buskill-light test       test mode: pulling the cable only sends a notification
+  buskill-light check      run the self-test now
+  buskill-light devices    list USB devices
+"""
+
+import json
+import os
+import socket
+import subprocess
+import sys
+import threading
+import time
+
+SOCK_PATH = os.environ.get("BUSKILL_LIGHT_SOCK", "/run/buskill-light/control.sock")
+ACTION_NAMES = {"soft-shutdown": "Power off", "lock-screen": "Lock screen"}
+DEAD_AFTER = 6.0  # seconds without a reply before we warn that the service is down
+
+
+class DaemonError(Exception):
+    pass
+
+
+def call(cmd, timeout=10, **kw):
+    req = dict(kw, cmd=cmd)
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
+            s.settimeout(timeout)
+            s.connect(SOCK_PATH)
+            s.sendall((json.dumps(req) + "\n").encode())
+            data = b""
+            while not data.endswith(b"\n"):
+                chunk = s.recv(65536)
+                if not chunk:
+                    break
+                data += chunk
+    except FileNotFoundError:
+        raise DaemonError("BusKill Light service is not running (%s missing)" % SOCK_PATH)
+    except ConnectionRefusedError:
+        raise DaemonError("BusKill Light service is not running (connection refused)")
+    except socket.timeout:
+        raise DaemonError("BusKill Light service is not responding")
+    except OSError as e:
+        raise DaemonError("cannot connect to the service: %s" % e)
+    if not data:
+        raise DaemonError("service closed the connection without a reply")
+    return json.loads(data.decode())
+
+
+def hm(ts):
+    return time.strftime("%H:%M:%S", time.localtime(ts)) if ts else "-"
+
+
+def print_status(st):
+    if st.get("armed"):
+        head = "ARMED" + (" (TEST MODE)" if st.get("mode") == "test" else "")
+        head += " since " + hm(st.get("armed_since"))
+    else:
+        head = "DISARMED"
+    h = st.get("health") or {}
+    print("BusKill Light: %s" % head)
+    print("  device    : %s" % (st.get("device") or st.get("device_error") or "-"))
+    print("  on removal: %s" % ACTION_NAMES.get(st.get("action"), st.get("action")))
+    if st.get("dry_run"):
+        print("  WARNING   : service runs in DRY RUN mode (will not power off)")
+    print("  self-test : %s at %s (every %s s)" % (
+        "OK" if h.get("ok") else ("PROBLEM" if h.get("ok") is False else "-"),
+        hm(h.get("checked_at")), st.get("interval")))
+    for c in h.get("checks", []):
+        mark = {True: " ok ", False: "FAIL", None: " -  "}[c["ok"]]
+        print("    [%s] %s: %s" % (mark, c["name"], c["text"]))
+    for n in h.get("notes", []):
+        print("    note: %s" % n)
+    if st.get("last_test"):
+        lt = st["last_test"]
+        print("  last unplug test: %s - passed (%s)" % (hm(lt["at"]), lt["reason"]))
+    if st.get("fired"):
+        print("  TRIGGERED at %s: %s" % (hm(st["fired"]["at"]), st["fired"]["reason"]))
+
+
+def cli(args):
+    cmd = args[0]
+    mapping = {"status": "status", "start": "arm", "arm": "arm", "stop": "disarm",
+               "disarm": "disarm", "test": "test", "check": "check"}
+    try:
+        if cmd == "devices":
+            for d in call("devices")["devices"]:
+                lab = (" [" + ", ".join(d["labels"]) + "]") if d["labels"] else ""
+                print("%s:%s  port %-6s %s %s%s  serial=%r%s" % (
+                    d["vid"], d["pid"], d["port"], d["manufacturer"], d["product"], lab,
+                    d["serial"], "  (hub)" if d["is_hub"] else ""))
+            return 0
+        if cmd not in mapping:
+            print(__doc__)
+            return 2
+        st = call(mapping[cmd], timeout=30)
+    except DaemonError as e:
+        print("ERROR: %s" % e, file=sys.stderr)
+        print("Check: systemctl status buskill-light", file=sys.stderr)
+        return 3
+    if not st.get("ok", True) and st.get("error"):
+        print("ERROR: %s" % st["error"], file=sys.stderr)
+    if "health" in st:
+        print_status(st)
+    if cmd == "test" and st.get("armed"):
+        print("\nNow unplug the BusKill cable - you should get a 'TEST PASSED' notification.")
+    if cmd in ("status", "check"):
+        return 0 if (st.get("health") or {}).get("ok") else 1
+    return 0 if st.get("ok", True) else 1
+
+
+CSS = b"""
+.bk-status { border-radius: 10px; padding: 14px 16px; }
+.bk-status label { color: #ffffff; }
+.bk-off   { background-color: #5a5f66; }
+.bk-ok    { background-color: #1e7b3c; }
+.bk-bad   { background-color: #b3261e; }
+.bk-test  { background-color: #b45f06; }
+.bk-big   { font-size: 20px; font-weight: bold; padding: 10px; }
+.bk-start, .bk-start:hover { background-image: none; background-color: #1e7b3c; color: #ffffff; border-color: #155c2c; }
+.bk-start:hover { background-color: #23914a; }
+.bk-start label { color: #ffffff; }
+.bk-err   { color: #d32f2f; font-weight: bold; }
+.bk-small { font-size: 9pt; }
+"""
+
+
+def gui(start_hidden=False):
+    import gi
+    gi.require_version("Gtk", "3.0")
+    from gi.repository import Gtk, Gdk, GLib, Gio
+    try:
+        gi.require_version("AyatanaAppIndicator3", "0.1")
+        from gi.repository import AyatanaAppIndicator3 as AI
+    except (ValueError, ImportError):
+        AI = None
+
+    def esc(s):
+        return GLib.markup_escape_text(str(s))
+
+    class App(Gtk.Application):
+        def __init__(self):
+            super().__init__(application_id="org.buskill.Light", flags=Gio.ApplicationFlags.FLAGS_NONE)
+            self.win = None
+            self.st = None
+            self.daemon_err = ""
+            self.last_ok_contact = time.monotonic()
+            self.dead_notified_at = None
+            self.busy = False
+            self.updating = False
+            self.indicator = None
+            self.first_activate = True
+
+        def do_startup(self):
+            Gtk.Application.do_startup(self)
+            prov = Gtk.CssProvider()
+            prov.load_from_data(CSS)
+            Gtk.StyleContext.add_provider_for_screen(Gdk.Screen.get_default(), prov,
+                                                     Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+            self.build_window()
+            if AI is not None:
+                self.build_indicator()
+                self.hold()  # keep running in the tray when the window is hidden
+            threading.Thread(target=self.poll_loop, daemon=True).start()
+
+        def do_activate(self):
+            if self.first_activate and start_hidden and self.indicator:
+                self.first_activate = False
+                return
+            self.first_activate = False
+            self.win.show_all()
+            self.refresh_widgets()
+            self.win.present()
+
+        def build_window(self):
+            w = Gtk.ApplicationWindow(application=self, title="BusKill Light")
+            w.set_default_size(470, -1)
+            w.set_resizable(False)
+            w.set_icon_name("buskill")
+            w.connect("delete-event", self.on_close)
+            self.win = w
+
+            root = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+            root.set_border_width(14)
+            w.add(root)
+
+            self.status_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+            self.status_box.get_style_context().add_class("bk-status")
+            self.status_title = Gtk.Label(xalign=0)
+            self.status_sub = Gtk.Label(xalign=0)
+            self.status_sub.set_line_wrap(True)
+            self.status_sub.set_max_width_chars(52)
+            self.status_box.pack_start(self.status_title, False, False, 0)
+            self.status_box.pack_start(self.status_sub, False, False, 0)
+            root.pack_start(self.status_box, False, False, 0)
+
+            self.btn = Gtk.Button(label="START")
+            self.btn.get_style_context().add_class("bk-big")
+            self.btn.set_size_request(-1, 64)
+            self.btn.connect("clicked", self.on_toggle)
+            root.pack_start(self.btn, False, False, 0)
+
+            row = Gtk.Box(spacing=8)
+            self.btn_test = Gtk.Button(label="Test (no shutdown)")
+            self.btn_test.set_tooltip_text("Arms in test mode: pulling the cable only sends a "
+                                           "notification, the computer stays on.")
+            self.btn_test.connect("clicked", lambda b: self.run_cmd("test"))
+            self.btn_check = Gtk.Button(label="Check now")
+            self.btn_check.set_tooltip_text("Run the self-test now instead of waiting for the next one.")
+            self.btn_check.connect("clicked", lambda b: self.run_cmd("check"))
+            row.pack_start(self.btn_test, True, True, 0)
+            row.pack_start(self.btn_check, True, True, 0)
+            root.pack_start(row, False, False, 0)
+
+            self.err_label = Gtk.Label(xalign=0)
+            self.err_label.get_style_context().add_class("bk-err")
+            self.err_label.set_line_wrap(True)
+            self.err_label.set_max_width_chars(52)
+            self.err_label.set_no_show_all(True)
+            root.pack_start(self.err_label, False, False, 0)
+
+            root.pack_start(Gtk.Separator(), False, False, 2)
+
+            grid = Gtk.Grid(column_spacing=10, row_spacing=8)
+            grid.attach(Gtk.Label(label="Device:", xalign=0), 0, 0, 1, 1)
+            self.dev_label = Gtk.Label(xalign=0)
+            self.dev_label.set_line_wrap(True)
+            self.dev_label.set_max_width_chars(34)
+            self.dev_label.set_hexpand(True)
+            grid.attach(self.dev_label, 1, 0, 1, 1)
+            self.btn_dev = Gtk.Button(label="Change…")
+            self.btn_dev.set_valign(Gtk.Align.CENTER)
+            self.btn_dev.connect("clicked", self.on_choose_device)
+            grid.attach(self.btn_dev, 2, 0, 1, 1)
+            grid.attach(Gtk.Label(label="On removal:", xalign=0), 0, 1, 1, 1)
+            self.action_combo = Gtk.ComboBoxText()
+            for k, v in ACTION_NAMES.items():
+                self.action_combo.append(k, v)
+            self.action_combo.connect("changed", self.on_action_changed)
+            grid.attach(self.action_combo, 1, 1, 2, 1)
+            root.pack_start(grid, False, False, 0)
+
+            root.pack_start(Gtk.Separator(), False, False, 2)
+
+            self.check_head = Gtk.Label(xalign=0)
+            root.pack_start(self.check_head, False, False, 0)
+            self.check_list = Gtk.Label(xalign=0)
+            self.check_list.set_line_wrap(True)
+            self.check_list.set_max_width_chars(54)
+            self.check_list.get_style_context().add_class("bk-small")
+            root.pack_start(self.check_list, False, False, 0)
+            self.extra_label = Gtk.Label(xalign=0)
+            self.extra_label.set_line_wrap(True)
+            self.extra_label.set_max_width_chars(54)
+            self.extra_label.get_style_context().add_class("bk-small")
+            root.pack_start(self.extra_label, False, False, 0)
+
+            hint = Gtk.Label(xalign=0)
+            hint.set_markup("<small><i>Closing this window does not disarm BusKill - the system "
+                            "service keeps watching. The top bar icon shows the current state.</i></small>")
+            hint.set_line_wrap(True)
+            hint.set_max_width_chars(54)
+            root.pack_start(hint, False, False, 0)
+
+            self.refresh_widgets()
+
+        def build_indicator(self):
+            ind = AI.Indicator.new("buskill-light", "changes-allow-symbolic",
+                                   AI.IndicatorCategory.APPLICATION_STATUS)
+            ind.set_status(AI.IndicatorStatus.ACTIVE)
+            ind.set_title("BusKill Light")
+            menu = Gtk.Menu()
+            self.mi_state = Gtk.MenuItem(label="BusKill Light")
+            self.mi_state.set_sensitive(False)
+            mi_show = Gtk.MenuItem(label="Show window")
+            mi_show.connect("activate", lambda *_: self.activate())
+            self.mi_toggle = Gtk.MenuItem(label="Start")
+            self.mi_toggle.connect("activate", self.on_toggle)
+            mi_test = Gtk.MenuItem(label="Test (no shutdown)")
+            mi_test.connect("activate", lambda *_: self.run_cmd("test"))
+            mi_quit = Gtk.MenuItem(label="Quit (BusKill keeps its current state)")
+            mi_quit.connect("activate", lambda *_: self.quit())
+            for mi in (self.mi_state, Gtk.SeparatorMenuItem(), mi_show, self.mi_toggle, mi_test,
+                       Gtk.SeparatorMenuItem(), mi_quit):
+                menu.append(mi)
+            menu.show_all()
+            ind.set_menu(menu)
+            ind.set_secondary_activate_target(mi_show)
+            self.indicator = ind
+
+        def on_close(self, *_):
+            if self.indicator is not None:
+                self.win.hide()
+                return True
+            return False
+
+        def poll_loop(self):
+            while True:
+                try:
+                    st = call("status", timeout=5)
+                    GLib.idle_add(self.on_status, st, None)
+                except Exception as e:
+                    GLib.idle_add(self.on_status, None, str(e))
+                time.sleep(1.0)
+
+        def on_status(self, st, err):
+            now = time.monotonic()
+            if st is not None:
+                self.st = st
+                self.last_ok_contact = now
+                if self.dead_notified_at is not None:
+                    self.dead_notified_at = None
+                    self.desktop_notify("BusKill Light: service is back", "Connection restored.", "normal")
+            else:
+                self.daemon_err = err
+                if now - self.last_ok_contact > DEAD_AFTER:
+                    self.st = None
+                    if self.dead_notified_at is None or now - self.dead_notified_at > 60:
+                        self.dead_notified_at = now
+                        self.desktop_notify(
+                            "BusKill Light is NOT running!",
+                            "The system service is not responding (%s) - pulling the cable may do nothing.\n"
+                            "Fix: sudo systemctl restart buskill-light" % err, "critical")
+            self.refresh_widgets()
+            return False
+
+        def run_cmd(self, cmd, **kw):
+            if self.busy:
+                return
+            self.busy = True
+            self.set_error(None)
+            self.refresh_widgets()
+
+            def work():
+                try:
+                    st = call(cmd, timeout=30, **kw)
+                    err = st.get("error") if not st.get("ok", True) else None
+                except Exception as e:
+                    st, err = None, str(e)
+                GLib.idle_add(self.cmd_done, st, err)
+
+            threading.Thread(target=work, daemon=True).start()
+
+        def cmd_done(self, st, err):
+            self.busy = False
+            if st is not None and "health" in st:
+                self.st = st
+                self.last_ok_contact = time.monotonic()
+            self.set_error(err)
+            self.refresh_widgets()
+            return False
+
+        def set_error(self, err):
+            if err:
+                self.err_label.set_text(err)
+                self.err_label.show()
+            else:
+                self.err_label.hide()
+
+        def desktop_notify(self, title, body, urgency):
+            try:
+                subprocess.Popen(["notify-send", "--app-name=BusKill Light", "--icon=buskill",
+                                  "--urgency=" + urgency, title, body],
+                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            except OSError:
+                pass
+
+        def on_toggle(self, *_):
+            if self.st and self.st.get("armed"):
+                self.run_cmd("disarm")
+            else:
+                self.run_cmd("arm")
+
+        def on_action_changed(self, combo):
+            if self.updating or not self.st:
+                return
+            a = combo.get_active_id()
+            if a and a != self.st.get("action"):
+                self.run_cmd("set-action", action=a)
+
+        def on_choose_device(self, *_):
+            try:
+                devs = call("devices")["devices"]
+            except Exception as e:
+                self.set_error(str(e))
+                return
+            cfgd = (self.st or {}).get("configured") or {}
+            dlg = Gtk.Dialog(title="Select BusKill device", transient_for=self.win, modal=True)
+            dlg.add_buttons("Cancel", Gtk.ResponseType.CANCEL, "Select", Gtk.ResponseType.OK)
+            box = dlg.get_content_area()
+            box.set_spacing(6)
+            box.set_border_width(12)
+            info = Gtk.Label(xalign=0)
+            info.set_markup("Pick the device whose <b>removal</b> should fire the trigger.\n"
+                            "Not sure which one? Unplug the BusKill cable, open this dialog, plug it\n"
+                            "back in and open it again - the new entry is your BusKill.")
+            box.pack_start(info, False, False, 4)
+            group = None
+            radios = []
+            for d in devs:
+                lab = (" [" + ", ".join(d["labels"]) + "]") if d["labels"] else ""
+                text = "%s %s%s\n<small>%s:%s · port %s · serial: %s%s</small>" % (
+                    esc(d["manufacturer"]), esc(d["product"]), esc(lab), d["vid"], d["pid"],
+                    esc(d["port"]), esc(d["serial"] or "none"), " · hub" if d["is_hub"] else "")
+                rb = Gtk.RadioButton.new_from_widget(group)
+                group = group or rb
+                lbl = Gtk.Label(xalign=0)
+                lbl.set_markup(text)
+                rb.add(lbl)
+                if (d["vid"] == cfgd.get("vid") and d["pid"] == cfgd.get("pid")
+                        and (not cfgd.get("serial") or d["serial"] == cfgd.get("serial"))
+                        and (not cfgd.get("port") or d["port"] == cfgd.get("port"))):
+                    rb.set_active(True)
+                radios.append((rb, d))
+                box.pack_start(rb, False, False, 2)
+            dlg.show_all()
+            resp = dlg.run()
+            chosen = next((d for rb, d in radios if rb.get_active()), None)
+            dlg.destroy()
+            if resp == Gtk.ResponseType.OK and chosen:
+                self.run_cmd("set-device", device=chosen)
+
+        def set_status_style(self, cls):
+            ctx = self.status_box.get_style_context()
+            for c in ("bk-off", "bk-ok", "bk-bad", "bk-test"):
+                ctx.remove_class(c)
+            ctx.add_class(cls)
+
+        def refresh_widgets(self):
+            st = self.st
+            btn_ctx = self.btn.get_style_context()
+            btn_ctx.remove_class("bk-start")
+            btn_ctx.remove_class("destructive-action")
+
+            if st is None:
+                dead = time.monotonic() - self.last_ok_contact > DEAD_AFTER
+                self.set_status_style("bk-bad" if dead else "bk-off")
+                self.status_title.set_markup("<span size='x-large' weight='bold'>%s</span>" % (
+                    "SERVICE NOT RUNNING" if dead else "Connecting to service…"))
+                self.status_sub.set_text(("BusKill might NOT fire. Run: sudo systemctl restart "
+                                          "buskill-light\n(%s)" % self.daemon_err) if dead else "")
+                self.btn.set_label("START")
+                for wdg in (self.btn, self.btn_test, self.btn_check, self.btn_dev, self.action_combo):
+                    wdg.set_sensitive(False)
+                self.dev_label.set_text("-")
+                self.check_head.set_text("")
+                self.check_list.set_text("")
+                self.extra_label.set_text("")
+                if dead:
+                    self.update_indicator("dialog-warning-symbolic", "BusKill Light: service down!", "Start")
+                return
+
+            armed, mode = st.get("armed"), st.get("mode")
+            h = st.get("health") or {}
+            healthy = h.get("ok")
+            action = st.get("action")
+            act_txt = "power off" if action == "soft-shutdown" else "screen lock"
+
+            if armed and mode == "test":
+                self.set_status_style("bk-test")
+                title = "TEST MODE"
+                sub = ("Unplug the BusKill cable now - you will get a notification "
+                       "(the computer will NOT shut down).")
+                icon, tip = "security-medium-symbolic", "BusKill Light: test mode"
+            elif armed and healthy is False:
+                self.set_status_style("bk-bad")
+                title = "ARMED - PROBLEM!"
+                sub = "Self-test found a problem - BusKill might not fire:\n" + "\n".join(
+                    "• " + p for p in h.get("problems", []))
+                icon, tip = "dialog-warning-symbolic", "BusKill Light: PROBLEM"
+            elif armed:
+                self.set_status_style("bk-ok")
+                title = "ARMED ✓"
+                sub = "Pulling the cable = %s.\nArmed since %s." % (act_txt, hm(st.get("armed_since")))
+                icon, tip = "security-high-symbolic", "BusKill Light: armed"
+            else:
+                self.set_status_style("bk-off")
+                title = "DISARMED"
+                sub = "Click START to arm."
+                if st.get("device_error"):
+                    sub += "\n" + st["device_error"]
+                icon, tip = "changes-allow-symbolic", "BusKill Light: disarmed"
+            if st.get("dry_run"):
+                sub += "\n[DRY RUN - development mode, nothing will be powered off]"
+            if st.get("fired") and armed:
+                sub += "\nTRIGGERED at %s: %s" % (hm(st["fired"]["at"]), st["fired"]["reason"])
+            self.status_title.set_markup("<span size='x-large' weight='bold'>%s</span>" % esc(title))
+            self.status_sub.set_text(sub)
+
+            if armed:
+                self.btn.set_label("STOP")
+                btn_ctx.add_class("destructive-action")
+            else:
+                self.btn.set_label("START")
+                btn_ctx.add_class("bk-start")
+            self.btn.set_sensitive(not self.busy)
+            self.btn_test.set_sensitive(not self.busy and not (armed and mode == "real"))
+            self.btn_check.set_sensitive(not self.busy)
+            self.btn_dev.set_sensitive(not self.busy and not armed)
+            self.action_combo.set_sensitive(not self.busy and not armed)
+
+            self.dev_label.set_text(st.get("device") or (st.get("configured") or {}).get("description")
+                                    or "not selected")
+            self.updating = True
+            self.action_combo.set_active_id(action)
+            self.updating = False
+
+            state = {True: "<span foreground='#1e7b3c'><b>OK</b></span>",
+                     False: "<span foreground='#d32f2f'><b>PROBLEM</b></span>",
+                     None: "-"}[healthy]
+            self.check_head.set_markup("<b>Self-test</b> (every %s s): %s · last: %s" % (
+                st.get("interval"), state, hm(h.get("checked_at"))))
+            lines = []
+            for c in h.get("checks", []):
+                mark = {True: "<span foreground='#1e7b3c'>✓</span>",
+                        False: "<span foreground='#d32f2f'>✗</span>", None: "–"}[c["ok"]]
+                lines.append("%s %s: %s" % (mark, esc(c["name"]), esc(c["text"])))
+            for n in h.get("notes", []):
+                lines.append("ℹ %s" % esc(n))
+            self.check_list.set_markup("\n".join(lines))
+            extra = []
+            if st.get("last_test"):
+                extra.append("Last unplug test: %s - passed ✓" % hm(st["last_test"]["at"]))
+            self.extra_label.set_text("\n".join(extra))
+            self.update_indicator(icon, tip, "Stop" if armed else "Start")
+
+        def update_indicator(self, icon, tip, toggle_label):
+            if self.indicator is None:
+                return
+            if getattr(self, "_ind_icon", None) != icon:
+                self.indicator.set_icon_full(icon, tip)
+                self._ind_icon = icon
+            self.indicator.set_title(tip)
+            self.mi_state.set_label(tip)
+            self.mi_toggle.set_label(toggle_label)
+
+    app = App()
+    return app.run([sys.argv[0]])
+
+
+def main():
+    args = sys.argv[1:]
+    if args and args[0] in ("-h", "--help", "help"):
+        print(__doc__)
+        return 0
+    if args and not args[0].startswith("--"):
+        return cli(args)
+    return gui(start_hidden="--hidden" in args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

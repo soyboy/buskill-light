@@ -1,0 +1,14 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=BusKill Light
+GenericName=USB Dead Man's Switch
+Comment=Start BusKill Light on login
+Exec=/usr/local/bin/buskill-light
+Icon=buskill
+Terminal=false
+Categories=Utility;Security;
+Keywords=buskill;security;usb;kill;shutdown;dead man;
+StartupNotify=true
+X-GNOME-Autostart-enabled=true
+X-GNOME-Autostart-Delay=2

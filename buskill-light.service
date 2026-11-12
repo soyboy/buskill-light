@@ -1,0 +1,20 @@
+[Unit]
+Description=BusKill Light - USB dead man's switch
+After=systemd-udevd.service
+StartLimitIntervalSec=0
+
+[Service]
+Type=notify
+NotifyAccess=main
+ExecStart=/usr/bin/python3 -I -u /usr/local/lib/buskill-light/buskill_lightd.py
+Restart=always
+RestartSec=1
+# a hung main loop gets restarted; the armed state survives in /run/buskill-light
+WatchdogSec=30
+RuntimeDirectory=buskill-light
+RuntimeDirectoryPreserve=yes
+OOMScoreAdjust=-1000
+SyslogIdentifier=buskill-light
+
+[Install]
+WantedBy=multi-user.target

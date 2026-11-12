@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=BusKill Light
+GenericName=USB Dead Man's Switch
+Comment=Arm BusKill: pulling the cable powers the computer off
+Exec=/usr/local/bin/buskill-light
+Icon=buskill
+Terminal=false
+Categories=Utility;Security;
+Keywords=buskill;security;usb;kill;shutdown;dead man;
+StartupNotify=true
